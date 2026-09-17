@@ -1,0 +1,214 @@
+name: Release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - v[0-9]+.*
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/create-gh-release-action@v1
+
+  upload-assets:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: tkt
+          target: ${{ matrix.target }}
+          archive: tkt-$target
+          tar: unix
+          zip: windows
+          checksum: sha256
+          locked: true
+          include: LICENSE,README.md
+
+  package-manifests:
+    needs: upload-assets
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Generate Homebrew + Scoop manifests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${GITHUB_REPOSITORY}"
+          mkdir -p dist /tmp/shas
+
+          # upload-rust-binary-action names checksums like tkt-$target.sha256
+          # (not $archive.tar.gz.sha256).
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-pc-windows-msvc \
+            aarch64-pc-windows-msvc
+          do
+            gh release download "$TAG" --repo "$REPO" --pattern "tkt-${target}.sha256" --dir /tmp/shas \
+              || echo "missing checksum for tkt-${target} (build may have failed)"
+          done
+
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          from textwrap import dedent
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag[1:] if tag.startswith("v") else tag
+          repo = os.environ["GITHUB_REPOSITORY"]
+          base = f"https://github.com/{repo}/releases/download/{tag}"
+          sha_dir = Path("/tmp/shas")
+
+          def sha_or_none(target: str):
+              path = sha_dir / f"tkt-{target}.sha256"
+              if not path.exists():
+                  return None
+              return path.read_text().strip().split()[0]
+
+          assets = {
+              "linux_x64": "tkt-x86_64-unknown-linux-gnu.tar.gz",
+              "linux_arm": "tkt-aarch64-unknown-linux-gnu.tar.gz",
+              "mac_x64": "tkt-x86_64-apple-darwin.tar.gz",
+              "mac_arm": "tkt-aarch64-apple-darwin.tar.gz",
+              "win_x64": "tkt-x86_64-pc-windows-msvc.zip",
+              "win_arm": "tkt-aarch64-pc-windows-msvc.zip",
+          }
+          targets = {
+              "linux_x64": "x86_64-unknown-linux-gnu",
+              "linux_arm": "aarch64-unknown-linux-gnu",
+              "mac_x64": "x86_64-apple-darwin",
+              "mac_arm": "aarch64-apple-darwin",
+              "win_x64": "x86_64-pc-windows-msvc",
+              "win_arm": "aarch64-pc-windows-msvc",
+          }
+          digests = {k: sha_or_none(t) for k, t in targets.items()}
+          if not any(digests.values()):
+              print("no release checksums found; skipping manifests", file=sys.stderr)
+              sys.exit(0)
+
+          def arch_block(kind: str, asset_key: str) -> str:
+              return dedent(f'''\
+                on_{kind} do
+                  url "{base}/{assets[asset_key]}"
+                  sha256 "{digests[asset_key]}"
+                end
+              ''')
+
+          mac_inner = ""
+          if digests["mac_arm"]:
+              mac_inner += arch_block("arm", "mac_arm")
+          if digests["mac_x64"]:
+              mac_inner += arch_block("intel", "mac_x64")
+
+          linux_inner = ""
+          if digests["linux_arm"]:
+              linux_inner += arch_block("arm", "linux_arm")
+          if digests["linux_x64"]:
+              linux_inner += arch_block("intel", "linux_x64")
+
+          body = ""
+          if mac_inner:
+              body += "  on_macos do\n"
+              body += "".join("  " + line + "\n" for line in mac_inner.splitlines())
+              body += "  end\n\n"
+          if linux_inner:
+              body += "  on_linux do\n"
+              body += "".join("  " + line + "\n" for line in linux_inner.splitlines())
+              body += "  end\n\n"
+
+          Path("dist").mkdir(exist_ok=True)
+
+          if body:
+              formula = (
+                  f'class Tkt < Formula\n'
+                  f'  desc "Terminal time tracker for personal ticket hours"\n'
+                  f'  homepage "https://github.com/{repo}"\n'
+                  f'  version "{version}"\n'
+                  f'  license "MIT"\n\n'
+                  f'{body}'
+                  f'  def install\n'
+                  f'    bin.install "tkt"\n'
+                  f'  end\n\n'
+                  f'  test do\n'
+                  f'    assert_predicate bin/"tkt", :exist?\n'
+                  f'  end\n'
+                  f'end\n'
+              )
+              Path("dist/tkt.rb").write_text(formula, newline="\n")
+
+          arch = {}
+          autoupdate_arch = {}
+          if digests["win_x64"]:
+              arch["64bit"] = {
+                  "url": f"{base}/{assets['win_x64']}",
+                  "hash": digests["win_x64"],
+              }
+              autoupdate_arch["64bit"] = {
+                  "url": f"https://github.com/{repo}/releases/download/v$version/{assets['win_x64']}"
+              }
+          if digests["win_arm"]:
+              arch["arm64"] = {
+                  "url": f"{base}/{assets['win_arm']}",
+                  "hash": digests["win_arm"],
+              }
+              autoupdate_arch["arm64"] = {
+                  "url": f"https://github.com/{repo}/releases/download/v$version/{assets['win_arm']}"
+              }
+
+          if arch:
+              scoop = {
+                  "version": version,
+                  "description": "Terminal time tracker for personal ticket hours",
+                  "homepage": f"https://github.com/{repo}",
+                  "license": "MIT",
+                  "architecture": arch,
+                  "bin": "tkt.exe",
+                  "checkver": {"github": f"https://github.com/{repo}"},
+                  "autoupdate": {"architecture": autoupdate_arch},
+              }
+              Path("dist/tkt.json").write_text(json.dumps(scoop, indent=2) + "\n", newline="\n")
+          PY
+
+          uploads=()
+          [ -f dist/tkt.rb ] && uploads+=(dist/tkt.rb)
+          [ -f dist/tkt.json ] && uploads+=(dist/tkt.json)
+          if [ "${#uploads[@]}" -eq 0 ]; then
+            echo "nothing to upload"
+            exit 0
+          fi
+          gh release upload "$TAG" "${uploads[@]}" --repo "$REPO" --clobber
