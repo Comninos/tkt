@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
-use crossterm::execute;
+use crossterm::{execute, ExecutableCommand, QueueableCommand};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -32,7 +33,12 @@ fn main() -> Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        // Batch the whole frame so theme swaps (and other full redraws) present
+        // atomically instead of painting top-to-bottom. Unsupported terminals
+        // ignore these sequences.
+        terminal.backend_mut().queue(BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui::draw(frame, app))?;
+        terminal.backend_mut().execute(EndSynchronizedUpdate)?;
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
