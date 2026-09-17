@@ -463,7 +463,7 @@ impl App {
         match self.focus {
             Focus::AgendaInput => self.agenda_input.push(c),
             Focus::TaskName => self.task_name.push(c),
-            Focus::Hours if c.is_ascii_digit() && self.hours_input.len() < 3 => {
+            Focus::Hours if c.is_ascii_digit() && self.hours_input.len() < 2 => {
                 self.hours_input.push(c);
             }
             Focus::Minutes if c.is_ascii_digit() && self.minutes_input.len() < 2 => {
@@ -523,7 +523,7 @@ impl App {
     fn submit_task(&mut self) -> Result<()> {
         let name = self.task_name.trim().to_string();
         if name.is_empty() {
-            self.status = "name required".into();
+            self.status = "task required".into();
             self.focus = Focus::TaskName;
             return Ok(());
         }
