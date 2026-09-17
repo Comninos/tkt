@@ -10,10 +10,19 @@ use crate::theme::Theme;
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
     let line = match &app.mode {
-        Mode::ConfirmDelete { name, .. } => Line::from(vec![
-            Span::styled(" delete \"", theme.help_style()),
-            Span::styled(name.clone(), Style::default().fg(theme.danger)),
-            Span::styled("\"? ", theme.help_style()),
+        Mode::ConfirmDeleteTask { name, .. } | Mode::ConfirmDeleteAgenda { name, .. } => {
+            Line::from(vec![
+                Span::styled(" delete \"", theme.help_style()),
+                Span::styled(name.clone(), Style::default().fg(theme.danger)),
+                Span::styled("\"? ", theme.help_style()),
+                key(&theme, "y"),
+                Span::styled(" yes · ", theme.help_style()),
+                key(&theme, "n"),
+                Span::styled(" no", theme.help_style()),
+            ])
+        }
+        Mode::ConfirmClearCompleted => Line::from(vec![
+            Span::styled(" clear completed? ", theme.help_style()),
             key(&theme, "y"),
             Span::styled(" yes · ", theme.help_style()),
             key(&theme, "n"),
@@ -25,6 +34,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 ("Tab", "next"),
                 ("Enter", "save"),
                 ("Esc", "cancel"),
+                ("C^t", "theme"),
+                ("C^p", "palette"),
+                ("C^q", "quit"),
+            ],
+        ),
+        Mode::EditingAgenda { .. } => hints(
+            &theme,
+            &[
+                ("Enter", "save"),
+                ("Esc", "cancel"),
+                ("C^t", "theme"),
+                ("C^p", "palette"),
+                ("C^q", "quit"),
             ],
         ),
         Mode::Normal => match app.focus {
@@ -32,28 +54,43 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 &theme,
                 &[
                     ("Enter", "add"),
-                    ("Space", "done"),
-                    ("↑↓", "select"),
-                    ("Tab", "log"),
+                    ("Space", "toggle"),
+                    ("e", "edit"),
+                    ("d", "del"),
+                    ("c", "clear"),
+                    ("[/]", "day"),
+                    ("C^t", "theme"),
+                    ("C^p", "palette"),
+                    ("C^q", "quit"),
                 ],
             ),
-            Focus::TaskName | Focus::Hours | Focus::Minutes => hints(
-                &theme,
-                &[
-                    ("Tab", "next"),
-                    ("Enter", "submit"),
-                    ("Ctrl+t", "theme"),
-                ],
-            ),
+            Focus::TaskName | Focus::Hours | Focus::Minutes => {
+                let tab = if app.focus == Focus::TaskName && app.name_completion().is_some() {
+                    ("Tab/→", "complete")
+                } else {
+                    ("Tab", "next")
+                };
+                hints(
+                    &theme,
+                    &[
+                        tab,
+                        ("Enter", "submit"),
+                        ("[/]", "day"),
+                        ("C^t", "theme"),
+                        ("C^p", "palette"),
+                        ("C^q", "quit"),
+                    ],
+                )
+            }
             Focus::TaskList => hints(
                 &theme,
                 &[
                     ("e", "edit"),
                     ("d", "del"),
-                    ("↑↓", "move"),
-                    ("t", "theme"),
-                    ("p", "palette"),
-                    ("q", "quit"),
+                    ("[/]", "day"),
+                    ("C^t", "theme"),
+                    ("C^p", "palette"),
+                    ("C^q", "quit"),
                 ],
             ),
         },

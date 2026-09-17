@@ -1,12 +1,15 @@
 use anyhow::Result;
+use chrono::{Duration, Local, NaiveDate};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
+use crate::config::Config;
 use crate::db::{AgendaItem, Db, Metrics, Task};
 use crate::theme::{Theme, ThemeId};
+use crate::week::day_anchor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -21,13 +24,18 @@ pub enum Focus {
 pub enum Mode {
     Normal,
     Editing { task_id: i64 },
-    ConfirmDelete { task_id: i64, name: String },
+    EditingAgenda { item_id: i64 },
+    ConfirmDeleteTask { task_id: i64, name: String },
+    ConfirmDeleteAgenda { item_id: i64, name: String },
+    ConfirmClearCompleted,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct LayoutRects {
     pub agenda: Rect,
     pub agenda_rows: Vec<Rect>,
+    /// Absolute agenda indices matching `agenda_rows`.
+    pub agenda_row_indices: Vec<usize>,
     pub agenda_input: Rect,
     pub form: Rect,
     pub name: Rect,
@@ -35,14 +43,19 @@ pub struct LayoutRects {
     pub minutes: Rect,
     pub tasks: Rect,
     pub task_rows: Vec<Rect>,
+    /// Absolute task indices matching `task_rows`.
+    pub task_row_indices: Vec<usize>,
 }
 
 pub struct App {
     pub db: Db,
+    pub config: Config,
     pub should_quit: bool,
     pub focus: Focus,
     pub mode: Mode,
     pub theme_id: ThemeId,
+    /// 0 = today, negative = days in the past. Never positive.
+    pub day_offset: i64,
     pub agenda_input: String,
     pub task_name: String,
     pub hours_input: String,
@@ -50,6 +63,7 @@ pub struct App {
     pub status: String,
     pub agenda: Vec<AgendaItem>,
     pub tasks: Vec<Task>,
+    pub name_suggestions: Vec<String>,
     pub metrics: Metrics,
     pub task_list_state: ListState,
     pub agenda_selected: usize,
@@ -57,14 +71,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(db: Db) -> Result<Self> {
+    pub fn new(db: Db, config: Config) -> Result<Self> {
         let theme_id = load_theme(&db)?;
         let mut app = Self {
             db,
+            config,
             should_quit: false,
             focus: Focus::TaskName,
             mode: Mode::Normal,
             theme_id,
+            day_offset: 0,
             agenda_input: String::new(),
             task_name: String::new(),
             hours_input: String::new(),
@@ -72,6 +88,7 @@ impl App {
             status: String::new(),
             agenda: Vec::new(),
             tasks: Vec::new(),
+            name_suggestions: Vec::new(),
             metrics: Metrics::default(),
             task_list_state: ListState::default(),
             agenda_selected: 0,
@@ -85,10 +102,44 @@ impl App {
         self.theme_id.theme()
     }
 
+    pub fn selected_date(&self) -> NaiveDate {
+        (Local::now() + Duration::days(self.day_offset)).date_naive()
+    }
+
+    pub fn selected_day(&self) -> chrono::DateTime<Local> {
+        if self.day_offset == 0 {
+            Local::now()
+        } else {
+            day_anchor(self.selected_date())
+        }
+    }
+
+    pub fn is_viewing_today(&self) -> bool {
+        self.day_offset == 0
+    }
+
+    pub fn name_completion(&self) -> Option<&str> {
+        if self.focus != Focus::TaskName || self.task_name.is_empty() {
+            return None;
+        }
+        let needle = self.task_name.to_ascii_lowercase();
+        self.name_suggestions.iter().find_map(|name| {
+            if name.to_ascii_lowercase().starts_with(&needle) && name.len() > self.task_name.len()
+            {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn reload(&mut self) -> Result<()> {
-        self.agenda = self.db.active_agenda()?;
-        self.tasks = self.db.todays_tasks()?;
-        self.metrics = self.db.metrics()?;
+        self.agenda = self.db.list_agenda()?;
+        self.tasks = self.db.tasks_for_day(self.selected_day())?;
+        self.metrics = self
+            .db
+            .metrics(self.selected_day(), self.config.week_start())?;
+        self.name_suggestions = self.db.recent_task_names(80)?;
         if self.agenda.is_empty() {
             self.agenda_selected = 0;
         } else if self.agenda_selected >= self.agenda.len() {
@@ -118,21 +169,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        if let Mode::ConfirmDelete { task_id, .. } = &self.mode {
-            let id = *task_id;
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.db.delete_task(id)?;
-                    self.mode = Mode::Normal;
-                    self.status = "task deleted".into();
-                    self.reload()?;
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.mode = Mode::Normal;
-                    self.status.clear();
-                }
-                _ => {}
-            }
+        if self.handle_confirm_key(key)? {
             return Ok(());
         }
 
@@ -155,23 +192,55 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('[') => {
+                self.shift_day(-1)?;
+                return Ok(());
+            }
+            KeyCode::Char(']') => {
+                self.shift_day(1)?;
+                return Ok(());
+            }
             KeyCode::Esc => {
-                if matches!(self.mode, Mode::Editing { .. }) {
+                if matches!(
+                    self.mode,
+                    Mode::Editing { .. } | Mode::EditingAgenda { .. }
+                ) {
                     self.cancel_edit();
                 } else if self.focus == Focus::TaskList {
                     self.focus = Focus::TaskName;
                 }
             }
-            KeyCode::Tab => self.focus_next(),
+            KeyCode::Tab => {
+                if self.try_accept_completion() {
+                    // accepted
+                } else {
+                    self.focus_next();
+                }
+            }
             KeyCode::BackTab => self.focus_prev(),
             KeyCode::Enter => self.on_enter()?,
             KeyCode::Backspace => self.on_backspace(),
+            KeyCode::Right if self.focus == Focus::TaskName => {
+                let _ = self.try_accept_completion();
+            }
             KeyCode::Up => self.on_up(),
             KeyCode::Down => self.on_down(),
             KeyCode::Char(' ')
                 if self.focus == Focus::AgendaInput && self.agenda_input.is_empty() =>
             {
-                self.complete_selected_agenda()?;
+                self.toggle_selected_agenda()?;
+            }
+            KeyCode::Char(c)
+                if self.focus == Focus::AgendaInput
+                    && self.agenda_input.is_empty()
+                    && matches!(self.mode, Mode::Normal) =>
+            {
+                match c {
+                    'e' => self.begin_edit_agenda()?,
+                    'd' => self.begin_delete_agenda(),
+                    'c' => self.begin_clear_completed(),
+                    _ => self.insert_char(c),
+                }
             }
             KeyCode::Char(c) if self.focus == Focus::TaskList => match c {
                 'e' => self.begin_edit()?,
@@ -185,6 +254,98 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_confirm_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match &self.mode {
+            Mode::ConfirmDeleteTask { task_id, .. } => {
+                let id = *task_id;
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.db.delete_task(id)?;
+                        self.mode = Mode::Normal;
+                        self.status = "task deleted".into();
+                        self.reload()?;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        self.status.clear();
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            Mode::ConfirmDeleteAgenda { item_id, .. } => {
+                let id = *item_id;
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.db.delete_agenda(id)?;
+                        self.mode = Mode::Normal;
+                        self.status = "agenda item deleted".into();
+                        self.reload()?;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        self.status.clear();
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            Mode::ConfirmClearCompleted => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let n = self.db.clear_completed_agenda()?;
+                        self.mode = Mode::Normal;
+                        self.status = format!("cleared {n} completed");
+                        self.reload()?;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        self.status.clear();
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn shift_day(&mut self, delta: i64) -> Result<()> {
+        let next = self.day_offset + delta;
+        if next > 0 {
+            self.status = "already at today".into();
+            return Ok(());
+        }
+        // Soft floor: ~10 years
+        if next < -3650 {
+            self.status = "day limit reached".into();
+            return Ok(());
+        }
+        self.day_offset = next;
+        if matches!(self.mode, Mode::Editing { .. }) {
+            self.cancel_edit();
+        }
+        self.reload()?;
+        if self.is_viewing_today() {
+            self.status = "today".into();
+        } else {
+            self.status = self.selected_date().format("%d %b %Y").to_string();
+        }
+        Ok(())
+    }
+
+    fn try_accept_completion(&mut self) -> bool {
+        if self.focus != Focus::TaskName {
+            return false;
+        }
+        if let Some(full) = self.name_completion().map(str::to_string) {
+            self.task_name = full;
+            true
+        } else {
+            false
+        }
     }
 
     fn toggle_light_dark(&mut self) -> Result<()> {
@@ -232,14 +393,17 @@ impl App {
                 }
                 for (i, rect) in self.rects.agenda_rows.iter().enumerate() {
                     if point_in(*rect, col, row) {
-                        self.agenda_selected = i;
-                        if col <= rect.x.saturating_add(3) {
-                            if let Some(item) = self.agenda.get(i) {
-                                let id = item.id;
-                                self.db.complete_agenda(id)?;
-                                self.reload()?;
-                                self.status = "agenda item done".into();
-                            }
+                        let abs = self
+                            .rects
+                            .agenda_row_indices
+                            .get(i)
+                            .copied()
+                            .unwrap_or(i);
+                        self.agenda_selected = abs;
+                        if col <= rect.x.saturating_add(3)
+                            && let Some(item) = self.agenda.get(self.agenda_selected).cloned()
+                        {
+                            self.toggle_agenda_id(item.id, item.completed)?;
                         }
                         self.focus = Focus::AgendaInput;
                         return Ok(());
@@ -247,7 +411,13 @@ impl App {
                 }
                 for (i, rect) in self.rects.task_rows.iter().enumerate() {
                     if point_in(*rect, col, row) {
-                        self.task_list_state.select(Some(i));
+                        let abs = self
+                            .rects
+                            .task_row_indices
+                            .get(i)
+                            .copied()
+                            .unwrap_or(i);
+                        self.task_list_state.select(Some(abs));
                         self.focus = Focus::TaskList;
                         return Ok(());
                     }
@@ -262,6 +432,8 @@ impl App {
             }
             MouseEventKind::ScrollUp if self.focus == Focus::TaskList => self.on_up(),
             MouseEventKind::ScrollDown if self.focus == Focus::TaskList => self.on_down(),
+            MouseEventKind::ScrollUp if self.focus == Focus::AgendaInput => self.on_up(),
+            MouseEventKind::ScrollDown if self.focus == Focus::AgendaInput => self.on_down(),
             _ => {}
         }
         Ok(())
@@ -326,10 +498,19 @@ impl App {
                 if name.is_empty() {
                     return Ok(());
                 }
-                self.db.add_agenda(&name)?;
+                match self.mode {
+                    Mode::EditingAgenda { item_id } => {
+                        self.db.update_agenda(item_id, &name)?;
+                        self.mode = Mode::Normal;
+                        self.status = "agenda item updated".into();
+                    }
+                    _ => {
+                        self.db.add_agenda(&name)?;
+                        self.status = "agenda item added".into();
+                    }
+                }
                 self.agenda_input.clear();
                 self.reload()?;
-                self.status = "agenda item added".into();
             }
             Focus::TaskName => self.focus = Focus::Hours,
             Focus::Hours => self.focus = Focus::Minutes,
@@ -381,11 +562,15 @@ impl App {
                 self.mode = Mode::Normal;
                 self.status = "task updated".into();
             }
-            Mode::Normal => {
-                self.db.add_task(&name, hours, minutes)?;
+            Mode::Normal | Mode::EditingAgenda { .. } => {
+                self.db
+                    .add_task(&name, hours, minutes, self.selected_day())?;
                 self.status = "task logged".into();
+                self.mode = Mode::Normal;
             }
-            Mode::ConfirmDelete { .. } => {}
+            Mode::ConfirmDeleteTask { .. }
+            | Mode::ConfirmDeleteAgenda { .. }
+            | Mode::ConfirmClearCompleted => {}
         }
 
         self.clear_form();
@@ -401,10 +586,21 @@ impl App {
     }
 
     fn cancel_edit(&mut self) {
-        self.mode = Mode::Normal;
-        self.clear_form();
-        self.status = "edit cancelled".into();
-        self.focus = Focus::TaskList;
+        match self.mode {
+            Mode::Editing { .. } => {
+                self.mode = Mode::Normal;
+                self.clear_form();
+                self.status = "edit cancelled".into();
+                self.focus = Focus::TaskList;
+            }
+            Mode::EditingAgenda { .. } => {
+                self.mode = Mode::Normal;
+                self.agenda_input.clear();
+                self.status = "edit cancelled".into();
+                self.focus = Focus::AgendaInput;
+            }
+            _ => {}
+        }
     }
 
     fn begin_edit(&mut self) -> Result<()> {
@@ -430,11 +626,44 @@ impl App {
         let Some(task) = self.tasks.get(idx) else {
             return;
         };
-        self.mode = Mode::ConfirmDelete {
+        self.mode = Mode::ConfirmDeleteTask {
             task_id: task.id,
             name: task.name.clone(),
         };
         self.status = format!("delete \"{}\"? [y/N]", task.name);
+    }
+
+    fn begin_edit_agenda(&mut self) -> Result<()> {
+        let Some(item) = self.agenda.get(self.agenda_selected).cloned() else {
+            return Ok(());
+        };
+        self.agenda_input = item.name;
+        self.mode = Mode::EditingAgenda {
+            item_id: item.id,
+        };
+        self.status = format!("editing agenda #{}", item.id);
+        Ok(())
+    }
+
+    fn begin_delete_agenda(&mut self) {
+        let Some(item) = self.agenda.get(self.agenda_selected) else {
+            return;
+        };
+        self.mode = Mode::ConfirmDeleteAgenda {
+            item_id: item.id,
+            name: item.name.clone(),
+        };
+        self.status = format!("delete \"{}\"? [y/N]", item.name);
+    }
+
+    fn begin_clear_completed(&mut self) {
+        let n = self.agenda.iter().filter(|a| a.completed).count();
+        if n == 0 {
+            self.status = "no completed items".into();
+            return;
+        }
+        self.mode = Mode::ConfirmClearCompleted;
+        self.status = format!("clear {n} completed? [y/N]");
     }
 
     fn on_up(&mut self) {
@@ -481,13 +710,22 @@ impl App {
         }
     }
 
-    fn complete_selected_agenda(&mut self) -> Result<()> {
-        if let Some(item) = self.agenda.get(self.agenda_selected) {
-            let id = item.id;
+    fn toggle_selected_agenda(&mut self) -> Result<()> {
+        if let Some(item) = self.agenda.get(self.agenda_selected).cloned() {
+            self.toggle_agenda_id(item.id, item.completed)?;
+        }
+        Ok(())
+    }
+
+    fn toggle_agenda_id(&mut self, id: i64, completed: bool) -> Result<()> {
+        if completed {
+            self.db.uncomplete_agenda(id)?;
+            self.status = "agenda item reopened".into();
+        } else {
             self.db.complete_agenda(id)?;
-            self.reload()?;
             self.status = "agenda item done".into();
         }
+        self.reload()?;
         Ok(())
     }
 
@@ -495,6 +733,21 @@ impl App {
         match self.mode {
             Mode::Editing { .. } => "log (editing · Esc cancel)",
             _ => "log",
+        }
+    }
+
+    pub fn agenda_title(&self) -> &'static str {
+        match self.mode {
+            Mode::EditingAgenda { .. } => "agenda (editing · Esc cancel)",
+            _ => "agenda",
+        }
+    }
+
+    pub fn tasks_title(&self) -> String {
+        if self.is_viewing_today() {
+            "today".into()
+        } else {
+            self.selected_date().format("%d %b").to_string()
         }
     }
 }

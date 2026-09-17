@@ -4,7 +4,6 @@ mod help;
 mod metrics;
 mod task_list;
 
-use chrono::Local;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::widgets::Block;
 use ratatui::Frame;
@@ -18,10 +17,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = app.theme();
     let area = frame.area();
 
-    // Full-bleed background chrome
     frame.render_widget(Block::default().style(theme.root_style()), area);
 
-    // 1u margin, then cap/center so maximized windows stay portrait-shaped
     let content = center_max_width(inset(area, 1), MAX_UI_WIDTH);
 
     let chunks = Layout::default()
@@ -35,7 +32,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(content);
 
-    let date_label = Local::now().format("%d %b %Y").to_string();
+    let date_label = app.selected_date().format("%d %b %Y").to_string();
 
     metrics::render(frame, chunks[0], app, &date_label);
     agenda::render(frame, chunks[1], app);
@@ -79,7 +76,7 @@ mod tests {
         let area = Rect::new(0, 0, 200, 40);
         let content = center_max_width(area, 88);
         assert_eq!(content.width, 88);
-        assert_eq!(content.x, 56); // (200 - 88) / 2
+        assert_eq!(content.x, 56);
         assert_eq!(content.height, 40);
     }
 

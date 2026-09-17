@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod db;
 mod goals;
 mod theme;
@@ -19,11 +20,13 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::App;
+use crate::config::Config;
 use crate::db::Db;
 
 fn main() -> Result<()> {
+    let config = Config::load_default().context("load config")?;
     let db = Db::open_default().context("open database")?;
-    let mut app = App::new(db)?;
+    let mut app = App::new(db, config)?;
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app);

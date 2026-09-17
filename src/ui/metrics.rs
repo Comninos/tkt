@@ -5,9 +5,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::goals::{
-    progress_ratio, ProgressLevel, DAY_GOAL_MINUTES, WEEK_GOAL_MINUTES,
-};
+use crate::goals::{progress_ratio, ProgressLevel};
 use crate::theme::Theme;
 use crate::ui::inner;
 use crate::week::format_hhmm;
@@ -19,15 +17,18 @@ const BAR_LABEL_WIDTH: usize = 5; // `"Day  "` / `"Week "`
 pub fn render(frame: &mut Frame, area: Rect, app: &App, date_label: &str) {
     let theme = app.theme();
     let m = &app.metrics;
+    let goals = &app.config.goals;
 
-    let day_level = ProgressLevel::for_day(m.today_minutes);
-    let week_level = ProgressLevel::for_week(m.week_minutes);
+    let day_level = ProgressLevel::for_day(m.today_minutes, goals);
+    let week_level = ProgressLevel::for_week(m.week_minutes, goals);
     let day_color = day_level.color(&theme);
     let week_color = week_level.color(&theme);
 
     let title = format!("tkt · {date_label}");
     let status = match &app.mode {
-        crate::app::Mode::ConfirmDelete { .. } => None,
+        crate::app::Mode::ConfirmDeleteTask { .. }
+        | crate::app::Mode::ConfirmDeleteAgenda { .. }
+        | crate::app::Mode::ConfirmClearCompleted => None,
         _ if app.status.is_empty() => None,
         _ => Some(app.status.as_str()),
     };
@@ -35,8 +36,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, date_label: &str) {
     let inner_area = inner(area);
     frame.render_widget(Paragraph::new("").block(block), area);
 
+    let day_label = if app.is_viewing_today() {
+        "Today"
+    } else {
+        "Day"
+    };
+
     let metrics_line = Line::from(vec![
-        Span::styled("Today ", Style::default().fg(theme.muted)),
+        Span::styled(format!("{day_label} "), Style::default().fg(theme.muted)),
         Span::styled(
             m.today.clone(),
             Style::default()
@@ -73,7 +80,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, date_label: &str) {
         &theme,
         "Day",
         m.today_minutes,
-        DAY_GOAL_MINUTES,
+        goals.day_bar_max_minutes,
         day_color,
         inner_area.width,
     );
@@ -81,7 +88,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, date_label: &str) {
         &theme,
         "Week",
         m.week_minutes,
-        WEEK_GOAL_MINUTES,
+        goals.week_bar_max_minutes,
         week_color,
         inner_area.width,
     );
@@ -95,18 +102,18 @@ fn bar_line(
     theme: &Theme,
     label: &str,
     minutes: i64,
-    goal: i64,
+    bar_max: i64,
     fill: ratatui::style::Color,
     total_width: u16,
 ) -> Line<'static> {
-    let suffix = format!(" {} / {}", format_hhmm(minutes), format_hhmm(goal));
+    let suffix = format!(" {} / {}", format_hhmm(minutes), format_hhmm(bar_max));
     debug_assert_eq!(suffix.chars().count(), BAR_SUFFIX_WIDTH);
 
     let bar_width = (total_width as usize)
         .saturating_sub(BAR_LABEL_WIDTH + BAR_SUFFIX_WIDTH)
         .max(8);
 
-    let ratio = progress_ratio(minutes, goal);
+    let ratio = progress_ratio(minutes, bar_max);
     let filled = ((ratio * bar_width as f64).round() as usize).min(bar_width);
     let empty = bar_width.saturating_sub(filled);
 

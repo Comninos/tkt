@@ -6,11 +6,12 @@ use ratatui::Frame;
 
 use crate::app::{App, Focus};
 use crate::ui::inner;
+use crate::week::window_start;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme();
     let focused = app.focus == Focus::AgendaInput;
-    let block = theme.panel("agenda", focused);
+    let block = theme.panel(app.agenda_title(), focused);
     let inner_area = inner(area);
     frame.render_widget(block, area);
 
@@ -25,31 +26,49 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     app.rects.agenda = area;
     app.rects.agenda_input = input_area;
     app.rects.agenda_rows.clear();
+    app.rects.agenda_row_indices.clear();
 
     let max_rows = list_area.height as usize;
+    let start = window_start(app.agenda_selected, app.agenda.len(), max_rows);
     let mut lines: Vec<Line> = Vec::new();
 
-    for (i, item) in app.agenda.iter().enumerate().take(max_rows) {
-        let selected = i == app.agenda_selected;
+    for (vis, (abs, item)) in app
+        .agenda
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_rows)
+        .enumerate()
+    {
+        let selected = abs == app.agenda_selected;
         let row_rect = Rect {
             x: list_area.x,
-            y: list_area.y.saturating_add(i as u16),
+            y: list_area.y.saturating_add(vis as u16),
             width: list_area.width,
             height: 1,
         };
         app.rects.agenda_rows.push(row_rect);
+        app.rects.agenda_row_indices.push(abs);
 
         let style = if selected {
             Style::default()
                 .fg(theme.highlight_fg)
                 .bg(theme.highlight_bg)
                 .add_modifier(Modifier::BOLD)
+        } else if item.completed {
+            Style::default().fg(theme.muted).bg(theme.surface)
         } else {
             Style::default().fg(theme.text).bg(theme.surface)
         };
+        let mark = if item.completed { "[x] " } else { "[ ] " };
+        let name_style = if item.completed {
+            style.add_modifier(Modifier::CROSSED_OUT)
+        } else {
+            style
+        };
         lines.push(Line::from(vec![
-            Span::styled("[ ] ", style),
-            Span::styled(item.name.clone(), style),
+            Span::styled(mark, style),
+            Span::styled(item.name.clone(), name_style),
         ]));
     }
 
@@ -68,10 +87,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let cursor = if focused { "▌" } else { "" };
     let input_line = Line::from(vec![
         Span::styled("> ", Style::default().fg(theme.accent)),
-        Span::styled(
-            app.agenda_input.clone(),
-            Style::default().fg(theme.text),
-        ),
+        Span::styled(app.agenda_input.clone(), Style::default().fg(theme.text)),
         Span::styled(cursor, Style::default().fg(theme.accent)),
     ]);
     frame.render_widget(
